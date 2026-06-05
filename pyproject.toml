@@ -6,7 +6,7 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "google-genai",
-    "google-cloud-aiplatform",
+    "rank-bm25",
     "audioop-lts",
 ]
 

@@ -1,20 +1,22 @@
-"""Vertex AI RAG検索＋800msタイムアウト＋300字要約（§4）
+"""In-Memory RAG検索＋関連スコア足切り＋300字要約（§4）
 
-Gemini 3.1 Flash Liveは非同期関数呼び出しに未対応であり、ツール実行完了まで
-音声生成がブロックされる。そのため検索には厳格なタイムアウトを課す。
-ブロッキングなVertex AI呼び出しはasyncio.to_threadでワーカースレッドに逃がし、
-asyncio.wait_forで800msのタイムアウトを課す。
+外部のVertex AIに依存せず、起動時にdata/manual_chunks.jsonをメモリへロードし、
+文字2-gramベースのBM25で検索する。低遅延のためタイムアウトは設けない。
+
+医療安全上、関連スコアがrag_min_score未満のチャンクは「該当なし」として捨てる。
+無関係な質問に対して無理に検索結果を返すとハルシネーションの原因になるためである。
 """
 
-import asyncio
+import json
+import os
 from dataclasses import dataclass
 
+from rank_bm25 import BM25Okapi
+
 from app.config import settings
-from app.constants import RAG_TIMEOUT_MESSAGE
 
 # RAGステータス（§5.2）
 STATUS_SUCCESS = "SUCCESS"
-STATUS_TIMEOUT = "TIMEOUT"
 
 # 応答種別（§5.2）
 RESPONSE_MANUAL_FOUND = "MANUAL_FOUND"
@@ -23,29 +25,55 @@ RESPONSE_NO_MANUAL = "NO_MANUAL_DESCRIPTION"
 # 該当記載がない場合にモデルへ返す文言（システムプロンプトのエスカレーションを誘発する）
 _NO_MANUAL_TEXT = "該当するマニュアルの記載が見つかりませんでした。"
 
+_MANUAL_FILE_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..", "data", "manual_chunks.json"
+)
+
 
 @dataclass(frozen=True)
 class RagResult:
     text: str  # ツールレスポンスとしてモデルへ返す文字列
-    status: str  # SUCCESS / TIMEOUT
+    status: str  # SUCCESS
     response_type: str  # MANUAL_FOUND / NO_MANUAL_DESCRIPTION
 
 
+def _tokenize(text: str) -> list[str]:
+    """日本語向けの文字2-gramトークナイザ（形態素解析器に依存しない）"""
+    return [text[i : i + 2] for i in range(len(text) - 1)]
+
+
+def _load_index() -> tuple[list[dict], BM25Okapi | None]:
+    """マニュアルをメモリへロードし、BM25インデックスを構築する"""
+    if not os.path.exists(_MANUAL_FILE_PATH):
+        return [], None
+    with open(_MANUAL_FILE_PATH, "r", encoding="utf-8") as f:
+        docs = json.load(f)
+    if not docs:
+        return [], None
+    bm25 = BM25Okapi([_tokenize(doc["text"]) for doc in docs])
+    return docs, bm25
+
+
+_MANUAL_DATA, _BM25 = _load_index()
+
+
 def _retrieve(query: str, category: str | None) -> list[str]:
-    """Vertex AI RAG Engineへの問い合わせ（ブロッキング）
+    """メモリ内のマニュアルからBM25スコア上位を抽出する
 
-    Top-3・チャンク300〜600文字で取得し、各チャンクのテキストを返す。
+    カテゴリ指定時は該当カテゴリに絞り、rag_min_score未満は除外する。
     """
-    import vertexai
-    from vertexai import rag
+    if _BM25 is None:
+        return []
 
-    vertexai.init(project=settings.gcp_project, location=settings.gcp_location)
-    response = rag.retrieval_query(
-        rag_resources=[rag.RagResource(rag_corpus=settings.rag_corpus)],
-        text=query,
-        rag_retrieval_config=rag.RagRetrievalConfig(top_k=settings.rag_top_k),
-    )
-    return [ctx.text for ctx in response.contexts.contexts]
+    scores = _BM25.get_scores(_tokenize(query))
+    candidates = [
+        (score, doc["text"])
+        for doc, score in zip(_MANUAL_DATA, scores)
+        if score >= settings.rag_min_score
+        and (category is None or doc.get("category") == category)
+    ]
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [text for _, text in candidates[: settings.rag_top_k]]
 
 
 def _summarize(chunks: list[str]) -> str:
@@ -59,17 +87,9 @@ def _summarize(chunks: list[str]) -> str:
 async def search(query: str, category: str | None = None) -> RagResult:
     """RAG検索を実行し、要約済みのツールレスポンスを返す
 
-    800msを超過した場合はタイムアウト文言を即座に返却する。
+    オンメモリ検索のためタイムアウトは発生しない。
     """
-    try:
-        chunks = await asyncio.wait_for(
-            asyncio.to_thread(_retrieve, query, category),
-            timeout=settings.rag_timeout_seconds,
-        )
-    except (asyncio.TimeoutError, TimeoutError):
-        return RagResult(RAG_TIMEOUT_MESSAGE, STATUS_TIMEOUT, RESPONSE_NO_MANUAL)
-
-    summary = _summarize(chunks)
+    summary = _summarize(_retrieve(query, category))
     if not summary:
         return RagResult(_NO_MANUAL_TEXT, STATUS_SUCCESS, RESPONSE_NO_MANUAL)
     return RagResult(summary, STATUS_SUCCESS, RESPONSE_MANUAL_FOUND)

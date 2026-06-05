@@ -24,7 +24,7 @@
 | Webフレームワーク | `fastapi` |
 | ASGIサーバー | `uvicorn[standard]` |
 | Gemini Live API（非同期クライアント） | `google-genai`（`client.aio.live.connect`） |
-| Vertex AI RAG Engine | `google-cloud-aiplatform`（vertexai） |
+| In-Memory RAG（マニュアル検索） | `rank-bm25`（`data/manual_chunks.json`を起動時ロード、文字2-gram BM25） |
 | 音声変換（μ-law⇔PCM16） | `audioop-lts`（Python 3.13でstdlibから削除されたaudioopの後継。`ulaw2lin`/`lin2ulaw`/`ratecv`を使用） |
 | 構造化ログ | 標準 `logging` + JSON出力（Cloud Logging連携） |
 | テスト | `pytest`, `pytest-asyncio` |

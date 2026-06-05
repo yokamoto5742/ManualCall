@@ -29,7 +29,7 @@ def build_audit_entry(
 ) -> dict[str, str]:
     """監査ログの構造化JSONエントリを生成する（§5.2）
 
-    rag_status: SUCCESS / TIMEOUT
+    rag_status: SUCCESS
     response_type: MANUAL_FOUND / NO_MANUAL_DESCRIPTION
     """
     return {
