@@ -13,9 +13,23 @@
 ### 2.1 採用技術一覧
 * **電話回線・音声中継:** Twilio Programmable Voice + Media Streams (双方向 WebSocket 中継)
 * **音声会話AIモデル:** Gemini 3.1 Flash Live (`models/gemini-3.1-flash-live-preview`)
-* **バックエンドサーバー:** Node.js + TypeScript + Fastify (WebSocket/リアルタイムI/O制御)
+* **バックエンドサーバー:** Python + FastAPI (Uvicorn/ASGI, WebSocket/asyncioによるリアルタイムI/O制御)
 * **RAG基盤:** Vertex AI RAG Engine
 * **ホスティング・インフラ:** Google Cloud Run (または GKE) + Secret Manager + Cloud Logging
+
+### 2.1.1 Python 主要ライブラリ
+
+| 用途 | ライブラリ |
+|---|---|
+| Webフレームワーク | `fastapi` |
+| ASGIサーバー | `uvicorn[standard]` |
+| Gemini Live API（非同期クライアント） | `google-genai`（`client.aio.live.connect`） |
+| Vertex AI RAG Engine | `google-cloud-aiplatform`（vertexai） |
+| 音声変換（μ-law⇔PCM16） | `audioop-lts`（Python 3.13でstdlibから削除されたaudioopの後継。`ulaw2lin`/`lin2ulaw`/`ratecv`を使用） |
+| 構造化ログ | 標準 `logging` + JSON出力（Cloud Logging連携） |
+| テスト | `pytest`, `pytest-asyncio` |
+
+> **音声変換方針:** μ-lawエンコード／デコードとサンプリングレート変換は枯れた`audioop`系API（`audioop-lts`）に委ねる。`ratecv`はチャンクをまたいで変換stateを保持する必要があるため、接続ごと・方向ごとにstateを管理する。
 
 ### 2.2 音声プロトコル・変換要件
 バックエンドサーバーは、Twilio と Gemini Live API 間の仲介者として、以下のフォーマット変換をリアルタイムに双方向で行う。
@@ -23,6 +37,35 @@
     ➡️ **[変換]** ➡️ `audio/pcm` (16,000Hz, 16-bit, Little-Endian, モノラル) として Gemini へ送信。
 * **AI応答（Gemini 出力）:** `audio/pcm` (16,000Hz, 16-bit) 
     ➡️ **[変換]** ➡️ `audio/x-mulaw` (8,000Hz, 8-bit) として Twilio へ返送。
+
+### 2.3 FastAPI 並行処理モデル
+
+1接続（1通話）ごとに、TwilioとのWebSocketとGeminiとのWebSocketを橋渡しする。FastAPIのWebSocketエンドポイント内で、双方向の中継を2つのasyncioタスクとして並行実行する。
+
+* **タスクA（上り）:** Twilio受信 → base64デコード → μ-law→PCM16・8k→16kリサンプル → Geminiへ送信
+* **タスクB（下り）:** Gemini受信 → PCM16・16k→8kリサンプル→μ-law → base64エンコード → Twilioへ送信
+* **ツール呼び出し:** GeminiからのtoolCall受信時、RAG検索を実行しtoolResponseを返却（タスクB内またはイベント駆動で処理）。
+
+タスクは`asyncio.TaskGroup`（または`gather`）で束ね、いずれかが終了・例外時に両方をキャンセルしてセッションをクリーンに終了する。Vertex AI RAG Engineの呼び出しはブロッキングのため`asyncio.to_thread`でワーカースレッドに逃がし、`asyncio.wait_for(..., timeout=0.8)`で800msタイムアウトを課す（§4.1）。
+
+### 2.4 モジュール構成（案）
+
+```
+app/
+  main.py                  # FastAPIアプリ初期化・ルーター登録・lifespan
+  config.py                # 環境変数・設定（Secret Manager由来の値）
+  constants.py             # UIメッセージ・固定文言（タイムアウト時文言・エスカレーション文言）
+  routers/
+    twiml.py               # POST /twiml/connect（TwiML応答）
+    media_stream.py        # WS /media-stream（双方向中継エンドポイント）
+  services/
+    gemini_live.py         # Gemini Liveセッション確立・SessionInit送信・送受信
+    audio_converter.py     # μ-law⇔PCM16変換・リサンプル（ratecv state管理）
+    rag_service.py         # Vertex AI RAG検索＋800msタイムアウト＋300字要約
+    audit_logger.py        # 構造化JSON監査ログ（§5.3）
+tests/
+  services/                # 各サービスの単体テスト
+```
 
 ---
 
@@ -154,8 +197,8 @@ Cloud Logging を用い、以下の構造化 JSON ログを出力する。
 
 
 * **Phase 2：リアルタイム音声ブリッジ構築（3〜4週）**
-* Fastify を用いた WebSocket サーバー実装、μ-law ⇔ PCM16 の音声相互変換ロジックの実装。
-* Gemini Live API セッションとの双方向音声ストリーミングの安定化および発話割り込み（Barge-in）制御の確認。
+* FastAPI を用いた WebSocket サーバー実装（`/media-stream`）、`audioop-lts` による μ-law ⇔ PCM16 の音声相互変換ロジック（接続ごと・方向ごとの`ratecv` state管理）の実装。
+* `google-genai` の非同期 Live クライアントによる双方向音声ストリーミングの安定化、asyncioタスク2本（上り/下り）の協調終了、および発話割り込み（Barge-in）制御の確認。
 
 
 *  Phase 3：RAGとセーフティ統合（5〜6週）
